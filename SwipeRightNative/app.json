@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "SwipeRight",
+    "slug": "swiperight",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": false,
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.daman.swiperight"
+    }
+  }
+}
