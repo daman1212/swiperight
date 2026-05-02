@@ -29,6 +29,13 @@ function detectCountry() {
 const { width } = Dimensions.get('window');
 const Stack = createNativeStackNavigator();
 
+// Get rate honoring user overrides (per-card, per-category)
+function getEffectiveRate(card, category, overrides = {}) {
+  const cardOv = overrides[card.id];
+  if (cardOv && cardOv[category] !== undefined) return cardOv[category];
+  return getRate(card, category);
+}
+
 const C = {
   bg: '#07070f',
   bg2: '#0e0e1a',
@@ -99,19 +106,35 @@ const CardTile = ({ card, selected, onToggle }) => (
 );
 
 // ── COUNTRY PICKER ────────────────────────────────────────
-function CountryPickerBtn({ light = false }) {
+function CountryPickerBtn({ light = false, navigation }) {
   const { country, countryCode, setCountryCode, ownedCards, setOwnedCards } = useApp();
   const [open, setOpen] = useState(false);
+  const [pendingCode, setPendingCode] = useState(null);
 
-  async function handleSwitch(newCode) {
-    if (newCode === countryCode) { setOpen(false); return; }
-    // Filter out cards that don't exist in the new country
+  async function performSwitch(newCode) {
     const newCountryCardIds = COUNTRIES[newCode].cards.map(c => c.id);
     const filtered = ownedCards.filter(id => newCountryCardIds.includes(id));
     setOwnedCards(filtered);
     await AsyncStorage.setItem('sr_cards', JSON.stringify(filtered));
     await setCountryCode(newCode);
     setOpen(false);
+    setPendingCode(null);
+    // If we lost cards (changed country with cards selected), redirect to Setup
+    if (filtered.length === 0 && ownedCards.length > 0 && navigation) {
+      navigation.navigate('Setup');
+    }
+  }
+
+  async function handleSwitch(newCode) {
+    if (newCode === countryCode) { setOpen(false); return; }
+    // Check if user will lose cards
+    const newCountryCardIds = COUNTRIES[newCode].cards.map(c => c.id);
+    const willLose = ownedCards.filter(id => !newCountryCardIds.includes(id)).length;
+    if (willLose > 0) {
+      setPendingCode(newCode);
+      return;
+    }
+    await performSwitch(newCode);
   }
 
   return (
@@ -135,6 +158,19 @@ function CountryPickerBtn({ light = false }) {
             ))}
           </View>
         </TouchableOpacity>
+      </Modal>
+      <Modal visible={pendingCode !== null} transparent animationType="fade" onRequestClose={() => setPendingCode(null)}>
+        <View style={styles.gateOverlay}>
+          <View style={styles.gateCard}>
+            <Text style={{ fontSize: 40, textAlign: 'center', marginBottom: 14 }}>🌍</Text>
+            <Text style={styles.gateTitle}>Switch to {pendingCode && COUNTRIES[pendingCode]?.name}?</Text>
+            <Text style={styles.gateSub}>Your selected cards are from {country.name}. Switching will clear them so you can pick {pendingCode && COUNTRIES[pendingCode]?.name} cards instead.</Text>
+            <PrimaryBtn label={`Switch to ${pendingCode && COUNTRIES[pendingCode]?.flag} ${pendingCode && COUNTRIES[pendingCode]?.name}`} onPress={() => performSwitch(pendingCode)} style={{ marginTop: 18 }} />
+            <TouchableOpacity onPress={() => setPendingCode(null)} style={{ marginTop: 12, alignItems: 'center' }}>
+              <Text style={styles.linkText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
       </Modal>
     </>
   );
@@ -217,7 +253,7 @@ function HomeScreen({ navigation }) {
 
 // ── LOGIN ─────────────────────────────────────────────────
 function LoginScreen({ navigation }) {
-  const { setSession, setOwnedCards, ownedCards } = useApp();
+  const { setSession, setOwnedCards, ownedCards, setIsGuest, setProfile } = useApp();
   const [step, setStep] = useState(1);
   const [email, setEmail] = useState('');
   const [otp, setOtp] = useState(['', '', '', '', '', '']);
@@ -246,36 +282,35 @@ function LoginScreen({ navigation }) {
     } else {
       const s = { id: data.user.id, email: data.user.email };
       setSession(s);
-      const { data: cardData } = await sb.from('user_cards').select('cards').eq('user_id', s.id).single();
+      setIsGuest(false);
+      // Check profile + cards in parallel
+      const [{ data: profileData }, { data: cardData }] = await Promise.all([
+        sb.from('profiles').select('*').eq('id', s.id).single(),
+        sb.from('user_cards').select('cards').eq('user_id', s.id).single(),
+      ]);
+      if (profileData) setProfile(profileData);
       let hasCards = ownedCards.length > 0;
       if (cardData?.cards) {
         setOwnedCards(cardData.cards);
         await AsyncStorage.setItem('sr_cards', JSON.stringify(cardData.cards));
         hasCards = cardData.cards.length > 0;
       }
-      navigation.reset({ index: 0, routes: [{ name: hasCards ? 'Checkout' : 'Setup' }] });
+      // Route:
+      // No profile → ProfileSetup
+      // Profile exists but no cards → Setup
+      // Profile + cards → Dashboard
+      let nextRoute = 'Dashboard';
+      if (!profileData) nextRoute = 'ProfileSetup';
+      else if (!hasCards) nextRoute = 'Setup';
+      navigation.reset({ index: 0, routes: [{ name: nextRoute }] });
     }
   }
 
   function handleOtpChange(val, i) {
     const v = val.replace(/\D/g, '');
-    const newOtp = [...otp];
-    if (v) {
-      // typing a digit
-      newOtp[i] = v[v.length - 1];
-      setOtp(newOtp);
-      if (i < 5) inputRefs.current[i + 1]?.focus();
-    } else {
-      // deleting (backspace)
-      if (newOtp[i]) {
-        newOtp[i] = '';
-        setOtp(newOtp);
-      } else if (i > 0) {
-        newOtp[i - 1] = '';
-        setOtp(newOtp);
-        inputRefs.current[i - 1]?.focus();
-      }
-    }
+    const newOtp = [...otp]; newOtp[i] = v ? v[0] : ''; setOtp(newOtp);
+    if (v && i < 5) inputRefs.current[i + 1]?.focus();
+    if (!v && i > 0) inputRefs.current[i - 1]?.focus();
   }
 
   return (
@@ -312,11 +347,17 @@ function LoginScreen({ navigation }) {
                     style={[styles.otpBox, val && styles.otpBoxFilled]}
                     value={val} onChangeText={v => handleOtpChange(v, i)}
                     onKeyPress={({ nativeEvent }) => {
-                      if (nativeEvent.key === 'Backspace' && !otp[i] && i > 0) {
-                        const newOtp = [...otp];
-                        newOtp[i - 1] = '';
-                        setOtp(newOtp);
-                        inputRefs.current[i - 1]?.focus();
+                      if (nativeEvent.key === 'Backspace') {
+                        setOtp(prev => {
+                          const newOtp = [...prev];
+                          if (newOtp[i]) {
+                            newOtp[i] = '';
+                          } else if (i > 0) {
+                            newOtp[i - 1] = '';
+                            setTimeout(() => inputRefs.current[i - 1]?.focus(), 0);
+                          }
+                          return newOtp;
+                        });
                       }
                     }}
                     keyboardType="number-pad" maxLength={1} textAlign="center" selectionColor={C.purpleLight} />
@@ -331,6 +372,680 @@ function LoginScreen({ navigation }) {
           )}
         </ScrollView>
       </KeyboardAvoidingView>
+    </SafeAreaView>
+  );
+}
+
+// ── PROFILE SETUP (first-time signup) ────────────────────
+function ProfileSetupScreen({ navigation }) {
+  const { session, setProfile, country, setCountryCode } = useApp();
+  const [firstName, setFirstName] = useState('');
+  const [lastName, setLastName] = useState('');
+  const [username, setUsername] = useState('');
+  const [city, setCity] = useState('');
+  const [selectedCountry, setSelectedCountry] = useState(country.code);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [usernameStatus, setUsernameStatus] = useState(null); // null, 'checking', 'available', 'taken', 'invalid'
+
+  // Auto-suggest username when first name changes
+  useEffect(() => {
+    if (firstName && !username) {
+      const suggested = (firstName + (lastName ? '_' + lastName.charAt(0) : '')).toLowerCase().replace(/[^a-z0-9_]/g, '');
+      if (suggested.length >= 3) setUsername(suggested);
+    }
+  }, [firstName, lastName]);
+
+  // Check username availability with debounce
+  useEffect(() => {
+    if (!username) { setUsernameStatus(null); return; }
+    if (username.length < 3) { setUsernameStatus('invalid'); return; }
+    if (!/^[a-z0-9_]+$/.test(username)) { setUsernameStatus('invalid'); return; }
+    setUsernameStatus('checking');
+    const t = setTimeout(async () => {
+      const { data } = await sb.from('profiles').select('username').eq('username', username).maybeSingle();
+      setUsernameStatus(data ? 'taken' : 'available');
+    }, 500);
+    return () => clearTimeout(t);
+  }, [username]);
+
+  async function handleContinue() {
+    if (!firstName.trim() || !lastName.trim() || !username.trim()) {
+      setError('Please fill in all required fields.');
+      return;
+    }
+    if (usernameStatus !== 'available') {
+      setError('Please pick an available username.');
+      return;
+    }
+    setLoading(true); setError('');
+    const { error: e } = await sb.from('profiles').insert({
+      id: session.id,
+      username: username.toLowerCase().trim(),
+      first_name: firstName.trim(),
+      last_name: lastName.trim(),
+      city: city.trim() || null,
+      country_code: selectedCountry,
+      email: session.email,
+    });
+    setLoading(false);
+    if (e) {
+      setError(e.message || 'Failed to save profile.');
+      return;
+    }
+    // Save country choice
+    await setCountryCode(selectedCountry);
+    setProfile({
+      id: session.id,
+      username: username.toLowerCase().trim(),
+      first_name: firstName.trim(),
+      last_name: lastName.trim(),
+      city: city.trim() || null,
+      country_code: selectedCountry,
+      email: session.email,
+    });
+    navigation.reset({ index: 0, routes: [{ name: 'Setup' }] });
+  }
+
+  const usernameColor = usernameStatus === 'available' ? C.green : usernameStatus === 'taken' || usernameStatus === 'invalid' ? C.red : C.text3;
+  const usernameMsg = {
+    checking: 'Checking…',
+    available: '✓ Available',
+    taken: '✗ Already taken',
+    invalid: 'Min 3 chars, letters/numbers/_ only',
+  }[usernameStatus] || '';
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar barStyle="light-content" />
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
+        <ScrollView contentContainerStyle={{ padding: 24, paddingBottom: 60 }} keyboardShouldPersistTaps="handled">
+          <Badge label="WELCOME" />
+          <Text style={[styles.screenTitle, { marginTop: 12 }]}>Tell us about you</Text>
+          <Text style={[styles.screenSub, { marginBottom: 24 }]}>This helps us personalize SwipeRightt for you.</Text>
+
+          <View style={{ flexDirection: 'row', gap: 10 }}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.fieldLabel}>FIRST NAME</Text>
+              <TextInput style={styles.profInput} value={firstName} onChangeText={setFirstName}
+                placeholder="John" placeholderTextColor={C.text3} autoCapitalize="words" />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.fieldLabel}>LAST NAME</Text>
+              <TextInput style={styles.profInput} value={lastName} onChangeText={setLastName}
+                placeholder="Smith" placeholderTextColor={C.text3} autoCapitalize="words" />
+            </View>
+          </View>
+
+          <Text style={[styles.fieldLabel, { marginTop: 18 }]}>USERNAME</Text>
+          <View style={{ position: 'relative' }}>
+            <Text style={styles.usernamePrefix}>@</Text>
+            <TextInput style={[styles.profInput, { paddingLeft: 32 }]} value={username}
+              onChangeText={t => setUsername(t.toLowerCase().replace(/[^a-z0-9_]/g, ''))}
+              placeholder="username" placeholderTextColor={C.text3} autoCapitalize="none" autoCorrect={false} maxLength={20} />
+          </View>
+          {usernameMsg ? <Text style={[styles.usernameStatus, { color: usernameColor }]}>{usernameMsg}</Text> : null}
+
+          <Text style={[styles.fieldLabel, { marginTop: 18 }]}>CITY (OPTIONAL)</Text>
+          <TextInput style={styles.profInput} value={city} onChangeText={setCity}
+            placeholder="Toronto" placeholderTextColor={C.text3} autoCapitalize="words" />
+
+          <Text style={[styles.fieldLabel, { marginTop: 18 }]}>YOUR COUNTRY</Text>
+          <View style={styles.countryChoices}>
+            {Object.values(COUNTRIES).map(c => (
+              <TouchableOpacity key={c.code} onPress={() => setSelectedCountry(c.code)} activeOpacity={0.7}
+                style={[styles.countryChoice, selectedCountry === c.code && styles.countryChoiceActive]}>
+                <Text style={{ fontSize: 28 }}>{c.flag}</Text>
+                <Text style={[styles.countryChoiceText, selectedCountry === c.code && { color: C.purpleLight }]}>{c.name}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          {error ? <Text style={[styles.errorText, { marginTop: 14 }]}>{error}</Text> : null}
+
+          <PrimaryBtn label="Continue →" onPress={handleContinue} loading={loading}
+            disabled={!firstName || !lastName || usernameStatus !== 'available'}
+            style={{ marginTop: 24 }} />
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
+  );
+}
+
+// ── PROFILE (view/edit) ───────────────────────────────────
+function ProfileScreen({ navigation }) {
+  const { session, profile, setProfile } = useApp();
+  const [firstName, setFirstName] = useState(profile?.first_name || '');
+  const [lastName, setLastName] = useState(profile?.last_name || '');
+  const [username, setUsername] = useState(profile?.username || '');
+  const [city, setCity] = useState(profile?.city || '');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [usernameStatus, setUsernameStatus] = useState('available');
+  const originalUsername = profile?.username || '';
+
+  useEffect(() => {
+    if (!username || username === originalUsername) { setUsernameStatus('available'); return; }
+    if (username.length < 3) { setUsernameStatus('invalid'); return; }
+    if (!/^[a-z0-9_]+$/.test(username)) { setUsernameStatus('invalid'); return; }
+    setUsernameStatus('checking');
+    const t = setTimeout(async () => {
+      const { data } = await sb.from('profiles').select('username').eq('username', username).maybeSingle();
+      setUsernameStatus(data ? 'taken' : 'available');
+    }, 500);
+    return () => clearTimeout(t);
+  }, [username]);
+
+  async function save() {
+    if (!firstName.trim() || !lastName.trim() || !username.trim()) {
+      setError('Please fill in all required fields.'); return;
+    }
+    if (usernameStatus !== 'available') {
+      setError('Please pick an available username.'); return;
+    }
+    setLoading(true); setError(''); setSuccess('');
+    const updates = {
+      username: username.toLowerCase().trim(),
+      first_name: firstName.trim(),
+      last_name: lastName.trim(),
+      city: city.trim() || null,
+      updated_at: new Date().toISOString(),
+    };
+    const { error: e } = await sb.from('profiles').update(updates).eq('id', session.id);
+    setLoading(false);
+    if (e) { setError(e.message); return; }
+    setProfile({ ...profile, ...updates });
+    setSuccess('✓ Profile updated');
+    setTimeout(() => setSuccess(''), 2000);
+  }
+
+  const usernameColor = usernameStatus === 'available' ? C.green : C.red;
+  const usernameMsg = username !== originalUsername ? ({
+    checking: 'Checking…',
+    available: '✓ Available',
+    taken: '✗ Already taken',
+    invalid: 'Min 3 chars, letters/numbers/_ only',
+  }[usernameStatus] || '') : '';
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar barStyle="light-content" />
+      <View style={styles.navBar}>
+        <View style={styles.logoRow}>
+          <TouchableOpacity onPress={() => navigation.goBack()} style={{ marginRight: 4 }}>
+            <Text style={styles.navLink}>←</Text>
+          </TouchableOpacity>
+          <Text style={styles.logoText}>My Profile</Text>
+        </View>
+      </View>
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
+        <ScrollView contentContainerStyle={{ padding: 24, paddingBottom: 60 }} keyboardShouldPersistTaps="handled">
+
+          <View style={styles.profileHero}>
+            <View style={styles.profileAvatar}>
+              <Text style={styles.profileAvatarText}>{(firstName || session?.email || 'U')[0].toUpperCase()}</Text>
+            </View>
+            <Text style={styles.profileName}>{firstName} {lastName}</Text>
+            <Text style={styles.profileHandle}>@{username}</Text>
+            <Text style={styles.profileEmail}>{session?.email}</Text>
+          </View>
+
+          <View style={{ flexDirection: 'row', gap: 10, marginTop: 8 }}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.fieldLabel}>FIRST NAME</Text>
+              <TextInput style={styles.profInput} value={firstName} onChangeText={setFirstName} autoCapitalize="words" />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.fieldLabel}>LAST NAME</Text>
+              <TextInput style={styles.profInput} value={lastName} onChangeText={setLastName} autoCapitalize="words" />
+            </View>
+          </View>
+
+          <Text style={[styles.fieldLabel, { marginTop: 18 }]}>USERNAME</Text>
+          <View style={{ position: 'relative' }}>
+            <Text style={styles.usernamePrefix}>@</Text>
+            <TextInput style={[styles.profInput, { paddingLeft: 32 }]} value={username}
+              onChangeText={t => setUsername(t.toLowerCase().replace(/[^a-z0-9_]/g, ''))}
+              autoCapitalize="none" autoCorrect={false} maxLength={20} />
+          </View>
+          {usernameMsg ? <Text style={[styles.usernameStatus, { color: usernameColor }]}>{usernameMsg}</Text> : null}
+
+          <Text style={[styles.fieldLabel, { marginTop: 18 }]}>CITY</Text>
+          <TextInput style={styles.profInput} value={city} onChangeText={setCity} autoCapitalize="words"
+            placeholder="Add your city" placeholderTextColor={C.text3} />
+
+          {error ? <Text style={[styles.errorText, { marginTop: 14 }]}>{error}</Text> : null}
+          {success ? <Text style={[styles.errorText, { marginTop: 14, color: C.green }]}>{success}</Text> : null}
+
+          <PrimaryBtn label="Save changes" onPress={save} loading={loading} style={{ marginTop: 24 }} />
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
+  );
+}
+
+// ── MY CARDS (signed-in user's wallet view) ───────────────
+function MyCardsScreen({ navigation }) {
+  const { ownedCards, toggleCard, country, cardOverrides } = useApp();
+  const owned = country.cards.filter(c => ownedCards.includes(c.id));
+
+  function hasOverrides(cardId) {
+    return cardOverrides[cardId] && Object.keys(cardOverrides[cardId]).length > 0;
+  }
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar barStyle="light-content" />
+      <View style={styles.navBar}>
+        <View style={styles.logoRow}>
+          <TouchableOpacity onPress={() => navigation.goBack()} style={{ marginRight: 4 }}>
+            <Text style={styles.navLink}>←</Text>
+          </TouchableOpacity>
+          <Text style={styles.logoText}>My Wallet</Text>
+        </View>
+        <Text style={styles.navLink}>{owned.length} card{owned.length !== 1 ? 's' : ''}</Text>
+      </View>
+
+      <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 40 }}>
+        {owned.length === 0 ? (
+          <View style={{ alignItems: 'center', paddingVertical: 40 }}>
+            <Text style={{ fontSize: 48, marginBottom: 14 }}>👛</Text>
+            <Text style={{ color: C.text, fontSize: 18, fontWeight: '700', textAlign: 'center' }}>Your wallet is empty</Text>
+            <Text style={{ color: C.text2, fontSize: 14, textAlign: 'center', marginTop: 8 }}>Add your cards to start optimizing your rewards</Text>
+          </View>
+        ) : (
+          <>
+            <Text style={[styles.hint, { marginBottom: 12 }]}>Tap a card to view or customize cashback rates.</Text>
+            {owned.map(card => (
+              <TouchableOpacity
+                key={card.id}
+                onPress={() => navigation.navigate('CardDetail', { cardId: card.id })}
+                activeOpacity={0.7}
+                style={styles.walletCard}
+              >
+                <CardVis colors={card.color} size="lg" />
+                <View style={{ flex: 1, marginLeft: 14 }}>
+                  <Text style={styles.walletCardName}>{card.name}</Text>
+                  <Text style={styles.walletCardBank}>{card.issuer}</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 6 }}>
+                    {hasOverrides(card.id) ? (
+                      <View style={styles.customBadge}>
+                        <Text style={styles.customBadgeText}>✏️ Custom rates</Text>
+                      </View>
+                    ) : (
+                      <Text style={styles.walletCardPerk} numberOfLines={1}>{card.perks[0]}</Text>
+                    )}
+                  </View>
+                </View>
+                <Text style={{ color: C.text3, fontSize: 18, marginLeft: 8 }}>›</Text>
+              </TouchableOpacity>
+            ))}
+          </>
+        )}
+
+        <PrimaryBtn label="+ Add a card" onPress={() => navigation.navigate('AddCards')} style={{ marginTop: 18 }} />
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+// ── CARD DETAIL (view & customize rates) ─────────────────
+function CardDetailScreen({ navigation, route }) {
+  const { cardId } = route.params;
+  const { country, cardOverrides, saveOverrides, toggleCard } = useApp();
+  const card = country.cards.find(c => c.id === cardId);
+  const [editingCat, setEditingCat] = useState(null);
+  const [editValue, setEditValue] = useState('');
+  const [showRemove, setShowRemove] = useState(false);
+
+  if (!card) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <View style={styles.navBar}>
+          <TouchableOpacity onPress={() => navigation.goBack()}>
+            <Text style={styles.navLink}>← Back</Text>
+          </TouchableOpacity>
+        </View>
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+          <Text style={{ color: C.text2 }}>Card not found</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  const overrides = cardOverrides[cardId] || {};
+  const hasAnyOverride = Object.keys(overrides).length > 0;
+
+  function effectiveRate(cat) {
+    return overrides[cat] !== undefined ? overrides[cat] : (card.rates[cat] || card.rates['other'] || 0);
+  }
+
+  function isOverridden(cat) {
+    return overrides[cat] !== undefined;
+  }
+
+  function startEdit(cat) {
+    setEditingCat(cat);
+    setEditValue(String(effectiveRate(cat)));
+  }
+
+  async function saveEdit() {
+    const num = parseFloat(editValue);
+    if (isNaN(num) || num < 0 || num > 100) {
+      setEditingCat(null);
+      return;
+    }
+    const defaultRate = card.rates[editingCat] || card.rates['other'] || 0;
+    const next = { ...cardOverrides };
+    if (Math.abs(num - defaultRate) < 0.01) {
+      // Same as default -> remove override
+      if (next[cardId]) {
+        const { [editingCat]: _, ...rest } = next[cardId];
+        if (Object.keys(rest).length === 0) {
+          const { [cardId]: __, ...others } = next;
+          await saveOverrides(others);
+        } else {
+          next[cardId] = rest;
+          await saveOverrides(next);
+        }
+      }
+    } else {
+      next[cardId] = { ...(next[cardId] || {}), [editingCat]: num };
+      await saveOverrides(next);
+    }
+    setEditingCat(null);
+  }
+
+  async function resetCategory(cat) {
+    const next = { ...cardOverrides };
+    if (next[cardId]) {
+      const { [cat]: _, ...rest } = next[cardId];
+      if (Object.keys(rest).length === 0) {
+        const { [cardId]: __, ...others } = next;
+        await saveOverrides(others);
+      } else {
+        next[cardId] = rest;
+        await saveOverrides(next);
+      }
+    }
+  }
+
+  async function resetAll() {
+    const next = { ...cardOverrides };
+    delete next[cardId];
+    await saveOverrides(next);
+  }
+
+  // Categories to show — country-specific store categories + 'other'
+  const categories = country.stores.map(s => ({ key: s.category, label: s.label, icon: s.icon }));
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar barStyle="light-content" />
+      <View style={styles.navBar}>
+        <View style={styles.logoRow}>
+          <TouchableOpacity onPress={() => navigation.goBack()} style={{ marginRight: 4 }}>
+            <Text style={styles.navLink}>←</Text>
+          </TouchableOpacity>
+          <Text style={styles.logoText}>Card Details</Text>
+        </View>
+        {hasAnyOverride && (
+          <TouchableOpacity onPress={resetAll}>
+            <Text style={[styles.navLink, { color: C.purpleLight }]}>Reset all</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+
+      <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 60 }} keyboardShouldPersistTaps="handled">
+        {/* Hero */}
+        <View style={styles.cardHero}>
+          <CardVis colors={card.color} size="lg" />
+          <View style={{ flex: 1, marginLeft: 14 }}>
+            <Text style={styles.cardHeroName}>{card.name}</Text>
+            <Text style={styles.cardHeroBank}>{card.issuer}</Text>
+            <Text style={styles.cardHeroFee}>
+              {card.annual_fee > 0 ? `${country.currency}${card.annual_fee}/year fee` : 'No annual fee'}
+            </Text>
+          </View>
+        </View>
+
+        {/* Perks */}
+        <Text style={[styles.fieldLabel, { marginTop: 8, marginBottom: 8 }]}>PERKS</Text>
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 18 }}>
+          {card.perks.map(p => (
+            <View key={p} style={styles.perk}><Text style={styles.perkText}>{p}</Text></View>
+          ))}
+        </View>
+
+        {/* Rates */}
+        <Text style={styles.fieldLabel}>CASHBACK RATES</Text>
+        <Text style={[styles.hint, { marginTop: 4, marginBottom: 12 }]}>
+          Tap any rate to customize. Useful if your actual rate differs from our defaults.
+        </Text>
+
+        {categories.map(cat => {
+          const rate = effectiveRate(cat.key);
+          const overridden = isOverridden(cat.key);
+          const rateColor = rate >= 4 ? C.green : rate >= 2 ? C.amber : C.text2;
+          return (
+            <TouchableOpacity
+              key={cat.key}
+              onPress={() => startEdit(cat.key)}
+              activeOpacity={0.6}
+              style={styles.rateRow}
+            >
+              <Text style={{ fontSize: 22, marginRight: 12 }}>{cat.icon}</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.rateRowLabel}>{cat.label}</Text>
+                {overridden && (
+                  <Text style={styles.rateRowDefault}>Default: {card.rates[cat.key] || card.rates['other'] || 0}%</Text>
+                )}
+              </View>
+              {overridden && (
+                <TouchableOpacity onPress={() => resetCategory(cat.key)} style={styles.rateResetBtn}>
+                  <Text style={styles.rateResetText}>↺</Text>
+                </TouchableOpacity>
+              )}
+              <View style={[styles.rateValueWrap, overridden && styles.rateValueWrapEdit]}>
+                <Text style={[styles.rateValue, { color: rateColor }]}>{rate}%</Text>
+              </View>
+            </TouchableOpacity>
+          );
+        })}
+
+        {/* Remove card */}
+        <TouchableOpacity onPress={() => setShowRemove(true)} activeOpacity={0.7} style={styles.removeCardBtn}>
+          <Text style={styles.removeCardBtnText}>Remove this card from wallet</Text>
+        </TouchableOpacity>
+      </ScrollView>
+
+      {/* Edit modal */}
+      <Modal visible={editingCat !== null} transparent animationType="fade" onRequestClose={() => setEditingCat(null)}>
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
+          <TouchableOpacity activeOpacity={1} onPress={() => setEditingCat(null)} style={styles.gateOverlay}>
+            <TouchableOpacity activeOpacity={1} onPress={() => {}} style={styles.gateCard}>
+              <Text style={styles.gateTitle}>
+                {categories.find(c => c.key === editingCat)?.icon} {categories.find(c => c.key === editingCat)?.label}
+              </Text>
+              <Text style={[styles.gateSub, { marginBottom: 14 }]}>Enter your actual cashback rate (%)</Text>
+              <View style={styles.rateEditWrap}>
+                <TextInput
+                  style={styles.rateEditInput}
+                  value={editValue}
+                  onChangeText={t => setEditValue(t.replace(/[^0-9.]/g, ''))}
+                  keyboardType="decimal-pad"
+                  autoFocus
+                  selectTextOnFocus
+                  textAlign="center"
+                  selectionColor={C.purpleLight}
+                />
+                <Text style={styles.rateEditPct}>%</Text>
+              </View>
+              <Text style={[styles.hint, { textAlign: 'center', marginTop: 8 }]}>
+                Default: {editingCat ? (card.rates[editingCat] || card.rates['other'] || 0) : 0}%
+              </Text>
+              <PrimaryBtn label="Save" onPress={saveEdit} style={{ marginTop: 18 }} />
+              <TouchableOpacity onPress={() => setEditingCat(null)} style={{ marginTop: 12, alignItems: 'center' }}>
+                <Text style={styles.linkText}>Cancel</Text>
+              </TouchableOpacity>
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </KeyboardAvoidingView>
+      </Modal>
+
+      {/* Remove confirm */}
+      <Modal visible={showRemove} transparent animationType="fade" onRequestClose={() => setShowRemove(false)}>
+        <View style={styles.gateOverlay}>
+          <View style={styles.gateCard}>
+            <Text style={{ fontSize: 40, textAlign: 'center', marginBottom: 14 }}>⚠️</Text>
+            <Text style={styles.gateTitle}>Remove {card.name}?</Text>
+            <Text style={styles.gateSub}>This card will be removed from your wallet and any custom rates will be deleted.</Text>
+            <TouchableOpacity
+              onPress={async () => {
+                await resetAll();
+                toggleCard(card.id);
+                setShowRemove(false);
+                navigation.goBack();
+              }}
+              activeOpacity={0.7}
+              style={[styles.removeConfirmBtn, { marginTop: 18 }]}
+            >
+              <Text style={styles.removeConfirmBtnText}>Remove from wallet</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => setShowRemove(false)} style={{ marginTop: 12, alignItems: 'center' }}>
+              <Text style={styles.linkText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+
+// ── ADD CARDS (signed-in: shows only cards user doesn't have) ─
+function AddCardsScreen({ navigation }) {
+  const { ownedCards, toggleCard, country } = useApp();
+  const [search, setSearch] = useState('');
+  const [expandedGroup, setExpandedGroup] = useState(null);
+
+  const CARDS = country.cards.filter(c => !ownedCards.includes(c.id));
+  const featuredIds = country.featuredIds;
+  const groups = country.groups;
+  const groupKey = country.groupBy;
+
+  function cardInGroup(card, group) {
+    if (groupKey === 'network') return card.network === group.id;
+    return card.issuer.toLowerCase().includes(group.id);
+  }
+
+  const searchResults = useMemo(() => {
+    if (!search.trim()) return [];
+    const q = search.toLowerCase();
+    return CARDS.filter(c =>
+      c.name.toLowerCase().includes(q) ||
+      c.issuer.toLowerCase().includes(q) ||
+      c.network.toLowerCase().includes(q) ||
+      c.perks.some(p => p.toLowerCase().includes(q))
+    );
+  }, [search, CARDS]);
+
+  const isSearching = search.trim().length > 0;
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar barStyle="light-content" />
+      <View style={styles.navBar}>
+        <View style={styles.logoRow}>
+          <TouchableOpacity onPress={() => navigation.goBack()} style={{ marginRight: 4 }}>
+            <Text style={styles.navLink}>←</Text>
+          </TouchableOpacity>
+          <Text style={styles.logoText}>Add a card</Text>
+        </View>
+        <TouchableOpacity onPress={() => navigation.goBack()}>
+          <Text style={styles.navLink}>Done</Text>
+        </TouchableOpacity>
+      </View>
+
+      <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 60 }} keyboardShouldPersistTaps="handled">
+        <Text style={[styles.screenSub, { marginBottom: 16 }]}>Pick a card to add to your wallet.</Text>
+
+        <View style={styles.searchBar}>
+          <Text style={{ fontSize: 16, marginRight: 8 }}>🔍</Text>
+          <TextInput style={styles.searchInput} value={search} onChangeText={setSearch}
+            placeholder="Search cards..." placeholderTextColor={C.text3}
+            autoCorrect={false} autoCapitalize="none" />
+          {search.length > 0 && (
+            <TouchableOpacity onPress={() => setSearch('')}>
+              <Text style={{ color: C.text3, fontSize: 16, paddingLeft: 8 }}>✕</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+
+        {CARDS.length === 0 ? (
+          <View style={{ alignItems: 'center', paddingVertical: 40 }}>
+            <Text style={{ fontSize: 40, marginBottom: 10 }}>🎉</Text>
+            <Text style={{ color: C.text, fontSize: 16, textAlign: 'center' }}>You already own all our cards!</Text>
+          </View>
+        ) : isSearching ? (
+          <>
+            <Text style={[styles.fieldLabel, { marginBottom: 12, marginTop: 8 }]}>{searchResults.length} RESULT{searchResults.length !== 1 ? 'S' : ''}</Text>
+            {searchResults.length === 0 ? (
+              <View style={{ alignItems: 'center', padding: 30 }}>
+                <Text style={{ fontSize: 32, marginBottom: 10 }}>🔍</Text>
+                <Text style={{ color: C.text2, textAlign: 'center' }}>No cards found for "{search}"</Text>
+              </View>
+            ) : (
+              <View style={styles.cardsGrid}>
+                {searchResults.map(card => (
+                  <CardTile key={card.id} card={card} selected={ownedCards.includes(card.id)} onToggle={toggleCard} />
+                ))}
+              </View>
+            )}
+          </>
+        ) : (
+          groups.map(group => {
+            const featured = (featuredIds[group.id] || []).map(id => CARDS.find(c => c.id === id)).filter(Boolean);
+            const allGroupCards = CARDS.filter(c => cardInGroup(c, group));
+            const remainingCards = allGroupCards.filter(c => !(featuredIds[group.id] || []).includes(c.id));
+            const isExpanded = expandedGroup === group.id;
+
+            if (allGroupCards.length === 0) return null;
+
+            return (
+              <View key={group.id} style={{ marginTop: 28 }}>
+                <View style={styles.networkHeader}>
+                  <View style={[styles.networkDot, { backgroundColor: group.color }]} />
+                  <Text style={styles.networkLabel}>{group.label.toUpperCase()}</Text>
+                </View>
+                <View style={styles.cardsGrid}>
+                  {featured.map(card => (
+                    <CardTile key={card.id} card={card} selected={ownedCards.includes(card.id)} onToggle={toggleCard} />
+                  ))}
+                </View>
+                {remainingCards.length > 0 && (
+                  !isExpanded ? (
+                    <TouchableOpacity onPress={() => setExpandedGroup(group.id)} style={styles.seeMoreBtn} activeOpacity={0.7}>
+                      <Text style={styles.seeMoreText}>See all {allGroupCards.length} {group.shortLabel} cards →</Text>
+                    </TouchableOpacity>
+                  ) : (
+                    <>
+                      <View style={[styles.cardsGrid, { marginTop: 10 }]}>
+                        {remainingCards.map(card => (
+                          <CardTile key={card.id} card={card} selected={ownedCards.includes(card.id)} onToggle={toggleCard} />
+                        ))}
+                      </View>
+                      <TouchableOpacity onPress={() => setExpandedGroup(null)} style={styles.seeMoreBtn} activeOpacity={0.7}>
+                        <Text style={styles.seeMoreText}>Show less ↑</Text>
+                      </TouchableOpacity>
+                    </>
+                  )
+                )}
+              </View>
+            );
+          })
+        )}
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -372,11 +1087,11 @@ function SetupScreen({ navigation }) {
       <StatusBar barStyle="light-content" />
       <View style={styles.navBar}>
         <View style={styles.logoRow}>
-          <CountryPickerBtn />
+          <CountryPickerBtn navigation={navigation} />
           <View style={styles.logoMark}><Text style={styles.logoMarkText}>↗</Text></View>
           <Text style={styles.logoText}>SwipeRightt</Text>
         </View>
-        <TouchableOpacity onPress={() => navigation.navigate('Checkout')}>
+        <TouchableOpacity onPress={() => navigation.navigate(session ? 'Dashboard' : 'Checkout')}>
           <Text style={styles.navLink}>{ownedCards.length > 0 ? 'Done' : 'Skip'}</Text>
         </TouchableOpacity>
       </View>
@@ -479,7 +1194,7 @@ function SetupScreen({ navigation }) {
           })
         )}
 
-        <PrimaryBtn label="Continue →" onPress={() => navigation.navigate('Checkout')} disabled={ownedCards.length === 0} style={{ marginTop: 28 }} />
+        <PrimaryBtn label="Continue →" onPress={() => navigation.navigate(session ? 'Dashboard' : 'Checkout')} disabled={ownedCards.length === 0} style={{ marginTop: 28 }} />
         {isGuest && (
           <TouchableOpacity onPress={() => navigation.navigate('Login')} activeOpacity={0.6} style={{ marginTop: 12, alignItems: 'center' }}>
             <Text style={[styles.hint, { textAlign: 'center' }]}>
@@ -494,7 +1209,7 @@ function SetupScreen({ navigation }) {
 
 // ── CHECKOUT ──────────────────────────────────────────────
 function CheckoutScreen({ navigation }) {
-  const { ownedCards, session, signOut, country } = useApp();
+  const { ownedCards, session, signOut, country, cardOverrides } = useApp();
   const [selectedStore, setSelectedStore] = useState(null);
   const [amount, setAmount] = useState('');
   const [showMenu, setShowMenu] = useState(false);
@@ -502,7 +1217,7 @@ function CheckoutScreen({ navigation }) {
   const quickAmounts = country.code === 'IN' ? [500, 1000, 2500, 5000, 10000] : [25, 50, 100, 200, 500];
   const owned = country.cards.filter(c => ownedCards.includes(c.id));
   const ranked = selectedStore
-    ? owned.map(card => ({ card, rate: getRate(card, selectedStore.category) })).sort((a, b) => b.rate - a.rate)
+    ? owned.map(card => ({ card, rate: getEffectiveRate(card, selectedStore.category, cardOverrides) })).sort((a, b) => b.rate - a.rate)
     : [];
 
   return (
@@ -510,7 +1225,12 @@ function CheckoutScreen({ navigation }) {
       <StatusBar barStyle="light-content" />
       <View style={styles.navBar}>
         <View style={styles.logoRow}>
-          <CountryPickerBtn />
+          {session ? (
+            <TouchableOpacity onPress={() => navigation.navigate('Dashboard')} style={{ marginRight: 4 }}>
+              <Text style={styles.navLink}>←</Text>
+            </TouchableOpacity>
+          ) : null}
+          <CountryPickerBtn navigation={navigation} />
           <View style={styles.logoMark}><Text style={styles.logoMarkText}>↗</Text></View>
           <Text style={styles.logoText}>SwipeRightt</Text>
         </View>
@@ -622,14 +1342,40 @@ function CheckoutScreen({ navigation }) {
 
 // ── RESULT ────────────────────────────────────────────────
 function ResultScreen({ navigation, route }) {
-  const { ownedCards, session, country } = useApp();
+  const { ownedCards, session, country, cardOverrides } = useApp();
   const { store, amount } = route.params;
   const owned = country.cards.filter(c => ownedCards.includes(c.id));
   const ranked = owned.map(card => {
-    const rate = getRate(card, store.category);
+    const rate = getEffectiveRate(card, store.category, cardOverrides);
     return { card, rate, earned: +(amount * rate / 100).toFixed(2) };
   }).sort((a, b) => b.earned - a.earned);
   const best = ranked[0];
+
+  // Save to history for signed-in users (only once per result view)
+  useEffect(() => {
+    if (!session || !best) return;
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem('sr_history');
+        const history = raw ? JSON.parse(raw) : [];
+        const entry = {
+          date: new Date().toISOString(),
+          storeId: store.id,
+          storeLabel: store.label,
+          storeIcon: store.icon,
+          amount,
+          cardId: best.card.id,
+          cardName: best.card.name,
+          cardIssuer: best.card.issuer,
+          rate: best.rate,
+          earned: best.earned,
+          currency: country.currency,
+        };
+        const updated = [entry, ...history].slice(0, 50);
+        await AsyncStorage.setItem('sr_history', JSON.stringify(updated));
+      } catch (e) {}
+    })();
+  }, []);
 
   if (!best) return null;
 
@@ -725,20 +1471,55 @@ const SPENDING_CATEGORIES = [
   { key: 'other', label: 'Everything else', icon: '💳', defaultCA: 300, defaultIN: 5000, maxCA: 3000, maxIN: 60000, stepCA: 50, stepIN: 1000 },
 ];
 
-function StepperRow({ label, icon, value, onChange, min, max, step, currency }) {
+function StepperRow({ label, icon, value, onChange, min, max, step, currency, expanded, onToggle }) {
+  const [trackWidth, setTrackWidth] = useState(0);
+  const pct = max > min ? (value - min) / (max - min) : 0;
+
+  function handleSliderTouch(e) {
+    if (trackWidth <= 0) return;
+    const x = e.nativeEvent.locationX;
+    const ratio = Math.max(0, Math.min(1, x / trackWidth));
+    let raw = min + ratio * (max - min);
+    raw = Math.round(raw / step) * step;
+    raw = Math.max(min, Math.min(max, raw));
+    onChange(raw);
+  }
+
   return (
-    <View style={styles.stepperRow}>
-      <Text style={{ fontSize: 22, marginRight: 12 }}>{icon}</Text>
-      <View style={{ flex: 1 }}>
-        <Text style={styles.stepperLabel}>{label}</Text>
-        <Text style={styles.stepperValue}>{currency}{value.toLocaleString()}/mo</Text>
-      </View>
-      <TouchableOpacity onPress={() => onChange(Math.max(min, value - step))} activeOpacity={0.6} style={styles.stepperBtn}>
-        <Text style={styles.stepperBtnText}>−</Text>
+    <View>
+      <TouchableOpacity onPress={onToggle} activeOpacity={0.6} style={styles.stepperRow}>
+        <Text style={{ fontSize: 22, marginRight: 12 }}>{icon}</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.stepperLabel}>{label}</Text>
+          <Text style={styles.stepperValue}>{currency}{value.toLocaleString()}/mo</Text>
+        </View>
+        <TouchableOpacity onPress={() => onChange(Math.max(min, value - step))} activeOpacity={0.6} style={styles.stepperBtn}>
+          <Text style={styles.stepperBtnText}>−</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={() => onChange(Math.min(max, value + step))} activeOpacity={0.6} style={styles.stepperBtn}>
+          <Text style={styles.stepperBtnText}>+</Text>
+        </TouchableOpacity>
       </TouchableOpacity>
-      <TouchableOpacity onPress={() => onChange(Math.min(max, value + step))} activeOpacity={0.6} style={styles.stepperBtn}>
-        <Text style={styles.stepperBtnText}>+</Text>
-      </TouchableOpacity>
+      {expanded && (
+        <View style={styles.sliderWrap}>
+          <View
+            style={styles.sliderTrack}
+            onLayout={e => setTrackWidth(e.nativeEvent.layout.width)}
+            onStartShouldSetResponder={() => true}
+            onMoveShouldSetResponder={() => true}
+            onResponderGrant={handleSliderTouch}
+            onResponderMove={handleSliderTouch}
+          >
+            <View style={styles.sliderTrackBg} />
+            <View style={[styles.sliderFill, { width: `${pct * 100}%` }]} />
+            <View style={[styles.sliderThumb, { left: `${pct * 100}%` }]} />
+          </View>
+          <View style={styles.sliderLabels}>
+            <Text style={styles.sliderLabelText}>{currency}{min.toLocaleString()}</Text>
+            <Text style={styles.sliderLabelText}>{currency}{max.toLocaleString()}</Text>
+          </View>
+        </View>
+      )}
     </View>
   );
 }
@@ -746,6 +1527,7 @@ function StepperRow({ label, icon, value, onChange, min, max, step, currency }) 
 function RecommendScreen({ navigation }) {
   const { ownedCards, country, session } = useApp();
   const [step, setStep] = useState(1); // 1: spending, 2: results
+  const [expandedCat, setExpandedCat] = useState(null);
   const [spending, setSpending] = useState(() => {
     const init = {};
     SPENDING_CATEGORIES.forEach(c => {
@@ -817,6 +1599,8 @@ function RecommendScreen({ navigation }) {
                   max={country.code === 'IN' ? c.maxIN : c.maxCA}
                   step={country.code === 'IN' ? c.stepIN : c.stepCA}
                   currency={cur}
+                  expanded={expandedCat === c.key}
+                  onToggle={() => setExpandedCat(expandedCat === c.key ? null : c.key)}
                 />
               ))}
               <View style={styles.totalRow}>
@@ -918,6 +1702,276 @@ function RecommendScreen({ navigation }) {
   );
 }
 
+// ── DASHBOARD (signed-in landing) ────────────────────────
+function DashboardScreen({ navigation }) {
+  const { session, profile, signOut, country, ownedCards } = useApp();
+  const [showMenu, setShowMenu] = useState(false);
+  const [history, setHistory] = useState([]);
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+  const slideAnim = useRef(new Animated.Value(20)).current;
+  const menuAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(fadeAnim, { toValue: 1, duration: 400, useNativeDriver: true }),
+      Animated.timing(slideAnim, { toValue: 0, duration: 400, useNativeDriver: true }),
+    ]).start();
+  }, []);
+
+  // Animate menu in/out
+  useEffect(() => {
+    Animated.timing(menuAnim, {
+      toValue: showMenu ? 1 : 0,
+      duration: 200,
+      useNativeDriver: true,
+    }).start();
+  }, [showMenu]);
+
+  // Reload history when screen focuses
+  useEffect(() => {
+    const unsubscribe = navigation.addListener('focus', async () => {
+      const raw = await AsyncStorage.getItem('sr_history');
+      setHistory(raw ? JSON.parse(raw) : []);
+    });
+    return unsubscribe;
+  }, [navigation]);
+
+  // Calculate this month's savings
+  const now = new Date();
+  const thisMonth = now.getMonth();
+  const thisYear = now.getFullYear();
+  const monthEntries = history.filter(h => {
+    const d = new Date(h.date);
+    return d.getMonth() === thisMonth && d.getFullYear() === thisYear && h.currency === country.currency;
+  });
+  const monthSavings = monthEntries.reduce((sum, h) => sum + (h.earned || 0), 0);
+
+  const recent = history.slice(0, 5);
+  const hour = new Date().getHours();
+  const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+  const displayName = profile?.first_name || (session?.email || '').split('@')[0];
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar barStyle="light-content" />
+      <View style={styles.navBar}>
+        <View style={styles.logoRow}>
+          <CountryPickerBtn navigation={navigation} />
+          <View style={styles.logoMark}><Text style={styles.logoMarkText}>↗</Text></View>
+          <Text style={styles.logoText}>SwipeRightt</Text>
+        </View>
+        <TouchableOpacity onPress={() => setShowMenu(!showMenu)} activeOpacity={0.7}>
+          <View style={styles.avatarSmall}>
+            <Text style={styles.avatarSmallText}>{(displayName || 'U')[0].toUpperCase()}</Text>
+          </View>
+        </TouchableOpacity>
+      </View>
+
+      {showMenu && (
+        <Animated.View
+          style={[
+            styles.profileMenu,
+            {
+              opacity: menuAnim,
+              transform: [{
+                translateY: menuAnim.interpolate({ inputRange: [0, 1], outputRange: [-10, 0] }),
+              }, {
+                scale: menuAnim.interpolate({ inputRange: [0, 1], outputRange: [0.95, 1] }),
+              }],
+            },
+          ]}
+        >
+          <View style={styles.profileMenuHeader}>
+            <Text style={styles.profileMenuName} numberOfLines={1}>{profile?.first_name} {profile?.last_name}</Text>
+            <Text style={styles.profileMenuEmail} numberOfLines={1}>@{profile?.username || session?.email}</Text>
+          </View>
+          <View style={styles.profileMenuActions}>
+            <TouchableOpacity
+              onPress={() => { setShowMenu(false); navigation.navigate('Profile'); }}
+              activeOpacity={0.6}
+              style={[styles.profileMenuBtn, styles.profileMenuBtnLeft]}
+            >
+              <Text style={styles.profileMenuBtnIcon}>👤</Text>
+              <Text style={styles.profileMenuBtnText}>My Profile</Text>
+            </TouchableOpacity>
+            <View style={styles.profileMenuDivider} />
+            <TouchableOpacity
+              onPress={async () => { setShowMenu(false); await signOut(); navigation.reset({ index: 0, routes: [{ name: 'Home' }] }); }}
+              activeOpacity={0.6}
+              style={[styles.profileMenuBtn, styles.profileMenuBtnRight]}
+            >
+              <Text style={styles.profileMenuBtnIcon}>↗</Text>
+              <Text style={[styles.profileMenuBtnText, { color: C.red }]}>Sign out</Text>
+            </TouchableOpacity>
+          </View>
+        </Animated.View>
+      )}
+
+      <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 40 }} onScrollBeginDrag={() => setShowMenu(false)}>
+        <Animated.View style={{ opacity: fadeAnim, transform: [{ translateY: slideAnim }] }}>
+          <Text style={styles.dashGreeting}>{greeting}{displayName ? `, ${displayName}` : ''} 👋</Text>
+          <Text style={styles.dashSub}>Ready to earn the most cashback today?</Text>
+
+          {/* Savings tracker */}
+          <View style={styles.savingsCard}>
+            <Text style={styles.savingsLabel}>YOU'VE EARNED THIS MONTH</Text>
+            <Text style={styles.savingsAmount}>{country.currency}{monthSavings.toFixed(2)}</Text>
+            <Text style={styles.savingsSub}>
+              {history.length === 0 ? 'Make your first purchase to start tracking' : `From ${monthEntries.length} purchase${monthEntries.length !== 1 ? 's' : ''}`}
+            </Text>
+          </View>
+
+          {/* Primary action */}
+          <TouchableOpacity onPress={() => navigation.navigate('Checkout')} activeOpacity={0.8} style={styles.dashPrimary}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.dashPrimaryTitle}>Find best card →</Text>
+              <Text style={styles.dashPrimarySub}>Pick a store, see your top card</Text>
+            </View>
+            <Text style={{ fontSize: 30 }}>🛒</Text>
+          </TouchableOpacity>
+
+          {/* Recent purchases */}
+          {recent.length > 0 && (
+            <>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>Recent</Text>
+              </View>
+              {recent.map((h, i) => (
+                <View key={i} style={styles.recentRow}>
+                  <View style={styles.recentIconWrap}>
+                    <Text style={{ fontSize: 18 }}>{h.storeIcon || '💳'}</Text>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.recentStore}>{h.storeLabel}</Text>
+                    <Text style={styles.recentMeta}>{h.cardName} · {new Date(h.date).toLocaleDateString()}</Text>
+                  </View>
+                  <View style={{ alignItems: 'flex-end' }}>
+                    <Text style={styles.recentEarned}>+{h.currency}{h.earned.toFixed(2)}</Text>
+                    <Text style={styles.recentAmount}>on {h.currency}{h.amount.toFixed(2)}</Text>
+                  </View>
+                </View>
+              ))}
+            </>
+          )}
+
+          {/* Find my next card CTA */}
+          <TouchableOpacity onPress={() => navigation.navigate('Recommend')} activeOpacity={0.7} style={[styles.nextCardCta, { width: '100%', marginTop: 18 }]}>
+            <Text style={styles.nextCardCtaIcon}>💡</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.nextCardCtaTitle}>Find my next card</Text>
+              <Text style={styles.nextCardCtaSub}>Personalized recommendations based on your spending</Text>
+            </View>
+            <Text style={styles.nextCardCtaArrow}>→</Text>
+          </TouchableOpacity>
+
+          {/* My Wallet button */}
+          <TouchableOpacity onPress={() => navigation.navigate('MyCards')} activeOpacity={0.7} style={styles.walletBtn}>
+            <Text style={{ fontSize: 24, marginRight: 12 }}>👛</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.walletBtnTitle}>My Wallet</Text>
+              <Text style={styles.walletBtnSub}>{ownedCards.length} card{ownedCards.length !== 1 ? 's' : ''} · Tap to view & manage</Text>
+            </View>
+            <Text style={styles.nextCardCtaArrow}>→</Text>
+          </TouchableOpacity>
+        </Animated.View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+// ── ONBOARDING ────────────────────────────────────────────
+const ONBOARDING_SLIDES = [
+  {
+    icon: '💳',
+    title: 'Add your cards',
+    sub: 'Tell us which credit cards you have. We support 90+ cards across major banks.',
+    accent: '#a78bfa',
+  },
+  {
+    icon: '🛒',
+    title: 'Pick where you\'re shopping',
+    sub: 'Grocery, gas, dining, travel — wherever you are, we\'ll find your best card instantly.',
+    accent: '#34d399',
+  },
+  {
+    icon: '✨',
+    title: 'Always swipe the right card',
+    sub: 'See exactly how much cashback you\'ll earn. Never leave money on the table again.',
+    accent: '#f59e0b',
+  },
+];
+
+function OnboardingScreen({ navigation }) {
+  const { setHasOnboarded } = useApp();
+  const [idx, setIdx] = useState(0);
+  const fadeAnim = useRef(new Animated.Value(1)).current;
+  const slideAnim = useRef(new Animated.Value(0)).current;
+
+  function transitionTo(newIdx) {
+    Animated.parallel([
+      Animated.timing(fadeAnim, { toValue: 0, duration: 160, useNativeDriver: true }),
+      Animated.timing(slideAnim, { toValue: -30, duration: 160, useNativeDriver: true }),
+    ]).start(() => {
+      setIdx(newIdx);
+      slideAnim.setValue(30);
+      Animated.parallel([
+        Animated.timing(fadeAnim, { toValue: 1, duration: 240, useNativeDriver: true }),
+        Animated.timing(slideAnim, { toValue: 0, duration: 240, useNativeDriver: true }),
+      ]).start();
+    });
+  }
+
+  async function finish() {
+    await AsyncStorage.setItem('sr_onboarded', '1');
+    setHasOnboarded(true);
+    navigation.reset({ index: 0, routes: [{ name: 'Home' }] });
+  }
+
+  function handleNext() {
+    if (idx < ONBOARDING_SLIDES.length - 1) {
+      transitionTo(idx + 1);
+    } else {
+      finish();
+    }
+  }
+
+  const slide = ONBOARDING_SLIDES[idx];
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar barStyle="light-content" />
+      <View style={styles.onbTop}>
+        <TouchableOpacity onPress={finish}>
+          <Text style={styles.navLink}>Skip</Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.onbBody}>
+        <Animated.View style={{ opacity: fadeAnim, transform: [{ translateX: slideAnim }], alignItems: 'center', width: '100%' }}>
+          <View style={[styles.onbIconWrap, { backgroundColor: slide.accent + '22', borderColor: slide.accent + '55' }]}>
+            <Text style={styles.onbIcon}>{slide.icon}</Text>
+          </View>
+          <Text style={styles.onbTitle}>{slide.title}</Text>
+          <Text style={styles.onbSub}>{slide.sub}</Text>
+        </Animated.View>
+      </View>
+
+      <View style={styles.onbFooter}>
+        <View style={styles.onbDots}>
+          {ONBOARDING_SLIDES.map((_, i) => (
+            <View key={i} style={[styles.onbDot, i === idx && styles.onbDotActive]} />
+          ))}
+        </View>
+        <PrimaryBtn
+          label={idx === ONBOARDING_SLIDES.length - 1 ? 'Get started →' : 'Next →'}
+          onPress={handleNext}
+          style={{ width: width - 48 }}
+        />
+      </View>
+    </SafeAreaView>
+  );
+}
+
 // ── MAIN APP ──────────────────────────────────────────────
 const navTheme = {
   dark: true,
@@ -932,11 +1986,19 @@ const navTheme = {
 
 export default function App() {
   const [session, setSession] = useState(null);
+  const [profile, setProfile] = useState(null);
   const [ownedCards, setOwnedCards] = useState([]);
+  const [cardOverrides, setCardOverrides] = useState({});
   const [isGuest, setIsGuest] = useState(false);
   const [booting, setBooting] = useState(true);
   const [initialRoute, setInitialRoute] = useState('Home');
   const [countryCode, setCountryCodeState] = useState('CA');
+  const [hasOnboarded, setHasOnboarded] = useState(true);
+
+  async function saveOverrides(next) {
+    setCardOverrides(next);
+    await AsyncStorage.setItem('sr_card_overrides', JSON.stringify(next));
+  }
 
   async function setCountryCode(code) {
     setCountryCodeState(code);
@@ -961,13 +2023,24 @@ export default function App() {
   async function signOut() {
     await sb.auth.signOut();
     await AsyncStorage.removeItem('sr_cards');
+    await AsyncStorage.removeItem('sr_history');
+    await AsyncStorage.removeItem('sr_card_overrides');
     setSession(null);
+    setProfile(null);
     setOwnedCards([]);
+    setCardOverrides({});
     setIsGuest(false);
   }
 
   useEffect(() => {
     async function boot() {
+      // Check if user has seen onboarding
+      const onboarded = await AsyncStorage.getItem('sr_onboarded');
+      if (!onboarded) {
+        setHasOnboarded(false);
+        setInitialRoute('Onboarding');
+      }
+
       // Load saved country first, otherwise auto-detect
       const savedCountry = await AsyncStorage.getItem('sr_country');
       if (savedCountry && COUNTRIES[savedCountry]) {
@@ -981,11 +2054,25 @@ export default function App() {
       const { data: { session: s } } = await sb.auth.getSession();
       const saved = await AsyncStorage.getItem('sr_cards');
       if (saved) setOwnedCards(JSON.parse(saved));
+      const savedOverrides = await AsyncStorage.getItem('sr_card_overrides');
+      if (savedOverrides) setCardOverrides(JSON.parse(savedOverrides));
       if (s) {
         setSession({ id: s.user.id, email: s.user.email });
+        // Load profile
+        const { data: profileData } = await sb.from('profiles').select('*').eq('id', s.user.id).single();
+        if (profileData) setProfile(profileData);
         const { data } = await sb.from('user_cards').select('cards').eq('user_id', s.user.id).single();
         if (data?.cards) { setOwnedCards(data.cards); await AsyncStorage.setItem('sr_cards', JSON.stringify(data.cards)); }
-        setInitialRoute('Checkout');
+        // Routing logic
+        if (onboarded) {
+          if (!profileData) {
+            setInitialRoute('ProfileSetup');
+          } else if (!data?.cards || data.cards.length === 0) {
+            setInitialRoute('Setup');
+          } else {
+            setInitialRoute('Dashboard');
+          }
+        }
       }
       setBooting(false);
     }
@@ -1002,7 +2089,7 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
-      <AppContext.Provider value={{ session, setSession, ownedCards, setOwnedCards, toggleCard, saveCards, isGuest, setIsGuest, signOut, countryCode, setCountryCode, country }}>
+      <AppContext.Provider value={{ session, setSession, profile, setProfile, ownedCards, setOwnedCards, toggleCard, saveCards, isGuest, setIsGuest, signOut, countryCode, setCountryCode, country, hasOnboarded, setHasOnboarded, cardOverrides, saveOverrides }}>
         <NavigationContainer theme={navTheme}>
           <Stack.Navigator
             initialRouteName={initialRoute}
@@ -1013,8 +2100,15 @@ export default function App() {
               animationDuration: 280,
             }}
           >
+            <Stack.Screen name="Onboarding" component={OnboardingScreen} options={{ animation: 'fade' }} />
             <Stack.Screen name="Home" component={HomeScreen} />
+            <Stack.Screen name="Dashboard" component={DashboardScreen} />
             <Stack.Screen name="Login" component={LoginScreen} />
+            <Stack.Screen name="ProfileSetup" component={ProfileSetupScreen} />
+            <Stack.Screen name="Profile" component={ProfileScreen} />
+            <Stack.Screen name="MyCards" component={MyCardsScreen} />
+            <Stack.Screen name="CardDetail" component={CardDetailScreen} />
+            <Stack.Screen name="AddCards" component={AddCardsScreen} />
             <Stack.Screen name="Setup" component={SetupScreen} />
             <Stack.Screen name="Checkout" component={CheckoutScreen} />
             <Stack.Screen name="Result" component={ResultScreen} />
@@ -1030,7 +2124,7 @@ export default function App() {
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: C.bg },
   homeContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24, paddingVertical: 40 },
-  homeTopBar: { flexDirection: 'row', paddingHorizontal: 20, paddingTop: 8 },
+  homeTopBar: { flexDirection: 'row', paddingHorizontal: 20, paddingTop: 8, zIndex: 10, position: 'relative' },
   countryBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: C.glass, borderWidth: 1, borderColor: C.glassBorder, borderRadius: 100, paddingHorizontal: 10, paddingVertical: 6, marginRight: 6 },
   countryFlag: { fontSize: 18 },
   countryArrow: { color: C.text3, fontSize: 11, marginLeft: 2 },
@@ -1152,6 +2246,106 @@ const styles = StyleSheet.create({
   totalRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingTop: 14, marginTop: 4, borderTopWidth: 1, borderTopColor: C.glassBorder },
   totalLabel: { fontSize: 11, fontWeight: '700', color: C.text3, letterSpacing: 1 },
   totalValue: { fontSize: 18, fontWeight: '800', color: C.purpleLight },
+  sliderWrap: { paddingVertical: 12, paddingHorizontal: 4, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.04)' },
+  sliderTrack: { height: 36, justifyContent: 'center' },
+  sliderTrackBg: { position: 'absolute', left: 0, right: 0, top: 16, height: 4, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 2 },
+  sliderFill: { position: 'absolute', left: 0, top: 16, height: 4, backgroundColor: '#a78bfa', borderRadius: 2 },
+  sliderThumb: { position: 'absolute', top: 8, width: 20, height: 20, borderRadius: 10, backgroundColor: '#fff', borderWidth: 2, borderColor: '#7c3aed', marginLeft: -10, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.4, shadowRadius: 4 },
+  sliderLabels: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 6, paddingHorizontal: 2 },
+  sliderLabelText: { fontSize: 11, color: 'rgba(255,255,255,0.4)', fontWeight: '600' },
+  // Onboarding
+  onbTop: { flexDirection: 'row', justifyContent: 'flex-end', paddingHorizontal: 24, paddingTop: 12 },
+  onbBody: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 32 },
+  onbIconWrap: { width: 120, height: 120, borderRadius: 60, justifyContent: 'center', alignItems: 'center', borderWidth: 2, marginBottom: 32 },
+  onbIcon: { fontSize: 56 },
+  onbTitle: { fontSize: 32, fontWeight: '800', color: C.text, textAlign: 'center', letterSpacing: -1, marginBottom: 14 },
+  onbSub: { fontSize: 16, color: C.text2, textAlign: 'center', lineHeight: 24, paddingHorizontal: 12 },
+  onbFooter: { paddingBottom: 28, paddingHorizontal: 24, alignItems: 'center' },
+  onbDots: { flexDirection: 'row', gap: 8, marginBottom: 24 },
+  onbDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: 'rgba(255,255,255,0.2)' },
+  onbDotActive: { width: 24, backgroundColor: C.purpleLight },
+  // Dashboard
+  dashGreeting: { fontSize: 28, fontWeight: '800', color: C.text, letterSpacing: -0.5, marginTop: 4 },
+  dashSub: { fontSize: 15, color: C.text2, marginTop: 4, marginBottom: 22 },
+  savingsCard: { backgroundColor: 'rgba(52,211,153,0.10)', borderWidth: 1, borderColor: 'rgba(52,211,153,0.30)', borderRadius: 22, padding: 22, marginBottom: 16 },
+  savingsLabel: { fontSize: 11, fontWeight: '700', color: C.green, letterSpacing: 1, marginBottom: 8 },
+  savingsAmount: { fontSize: 44, fontWeight: '800', color: C.green, letterSpacing: -2 },
+  savingsSub: { fontSize: 13, color: C.text2, marginTop: 6 },
+  dashPrimary: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.purple, borderRadius: 18, padding: 22, marginBottom: 16 },
+  dashPrimaryTitle: { color: '#fff', fontSize: 20, fontWeight: '800', letterSpacing: -0.5 },
+  dashPrimarySub: { color: 'rgba(255,255,255,0.85)', fontSize: 13, marginTop: 4 },
+  sectionHeader: { marginTop: 12, marginBottom: 12 },
+  sectionTitle: { fontSize: 16, fontWeight: '800', color: C.text, letterSpacing: -0.3 },
+  recentRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.glass, borderWidth: 1, borderColor: C.glassBorder, borderRadius: 14, padding: 14, marginBottom: 8 },
+  recentIconWrap: { width: 38, height: 38, borderRadius: 10, backgroundColor: 'rgba(255,255,255,0.05)', justifyContent: 'center', alignItems: 'center', marginRight: 12 },
+  recentStore: { color: C.text, fontSize: 15, fontWeight: '700' },
+  recentMeta: { color: C.text3, fontSize: 12, marginTop: 2 },
+  recentEarned: { color: C.green, fontSize: 15, fontWeight: '800' },
+  recentAmount: { color: C.text3, fontSize: 11, marginTop: 2 },
+  // Profile menu (animated dropdown)
+  profileMenu: { position: 'absolute', top: 64, right: 16, backgroundColor: C.bg2, borderWidth: 1, borderColor: C.glassBorder, borderRadius: 16, padding: 12, minWidth: 260, shadowColor: '#000', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.6, shadowRadius: 16, zIndex: 100 },
+  profileMenuHeader: { paddingHorizontal: 8, paddingVertical: 6, marginBottom: 6 },
+  profileMenuName: { color: C.text, fontSize: 14, fontWeight: '700' },
+  profileMenuEmail: { color: C.text3, fontSize: 12, marginTop: 2 },
+  profileMenuActions: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.04)', borderRadius: 12, overflow: 'hidden' },
+  profileMenuBtn: { flex: 1, alignItems: 'center', paddingVertical: 12, paddingHorizontal: 8 },
+  profileMenuBtnLeft: {},
+  profileMenuBtnRight: {},
+  profileMenuDivider: { width: 1, height: 36, backgroundColor: C.glassBorder },
+  profileMenuBtnIcon: { fontSize: 18, marginBottom: 4 },
+  profileMenuBtnText: { color: C.text, fontSize: 13, fontWeight: '700' },
+  // Wallet button on dashboard
+  walletBtn: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(124,58,237,0.10)', borderWidth: 1, borderColor: 'rgba(124,58,237,0.30)', borderRadius: 16, padding: 16, marginTop: 12 },
+  walletBtnTitle: { color: C.text, fontSize: 15, fontWeight: '700' },
+  walletBtnSub: { color: C.text2, fontSize: 12, marginTop: 2 },
+  // Profile setup / edit
+  profInput: { backgroundColor: C.glass, borderWidth: 1, borderColor: C.glassBorder, borderRadius: 12, padding: 14, color: C.text, fontSize: 16, marginTop: 6 },
+  usernamePrefix: { position: 'absolute', left: 14, top: 20, color: C.text3, fontSize: 16, fontWeight: '600', zIndex: 1 },
+  usernameStatus: { fontSize: 12, marginTop: 6, fontWeight: '600' },
+  countryChoices: { flexDirection: 'row', gap: 10, marginTop: 6 },
+  countryChoice: { flex: 1, alignItems: 'center', backgroundColor: C.glass, borderWidth: 1, borderColor: C.glassBorder, borderRadius: 14, paddingVertical: 16, gap: 6 },
+  countryChoiceActive: { backgroundColor: 'rgba(124,58,237,0.15)', borderColor: C.purpleLight },
+  countryChoiceText: { color: C.text, fontSize: 14, fontWeight: '700' },
+  // Profile screen
+  profileHero: { alignItems: 'center', marginBottom: 28, paddingTop: 8 },
+  profileAvatar: { width: 88, height: 88, borderRadius: 44, backgroundColor: C.purple, justifyContent: 'center', alignItems: 'center', marginBottom: 14 },
+  profileAvatarText: { color: '#fff', fontSize: 36, fontWeight: '800' },
+  profileName: { color: C.text, fontSize: 22, fontWeight: '800', letterSpacing: -0.5 },
+  profileHandle: { color: C.purpleLight, fontSize: 14, fontWeight: '700', marginTop: 4 },
+  profileEmail: { color: C.text3, fontSize: 13, marginTop: 4 },
+  // My Wallet screen
+  walletCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.glass, borderWidth: 1, borderColor: C.glassBorder, borderRadius: 18, padding: 16, marginBottom: 12 },
+  walletCardName: { color: C.text, fontSize: 16, fontWeight: '700' },
+  walletCardBank: { color: C.text2, fontSize: 13, marginTop: 2 },
+  walletCardPerk: { color: C.text3, fontSize: 11, marginTop: 6 },
+  removeBtn: { width: 32, height: 32, borderRadius: 16, backgroundColor: 'rgba(248,113,113,0.15)', borderWidth: 1, borderColor: 'rgba(248,113,113,0.4)', justifyContent: 'center', alignItems: 'center' },
+  removeBtnText: { color: C.red, fontSize: 14, fontWeight: '800' },
+  // Custom rates badge
+  customBadge: { backgroundColor: 'rgba(167,139,250,0.15)', borderWidth: 1, borderColor: 'rgba(167,139,250,0.4)', borderRadius: 100, paddingHorizontal: 8, paddingVertical: 3, alignSelf: 'flex-start' },
+  customBadgeText: { color: C.purpleLight, fontSize: 10, fontWeight: '700' },
+  // Card detail hero
+  cardHero: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.glass, borderWidth: 1, borderColor: C.glassBorder, borderRadius: 18, padding: 18, marginBottom: 18 },
+  cardHeroName: { color: C.text, fontSize: 20, fontWeight: '800', letterSpacing: -0.5 },
+  cardHeroBank: { color: C.text2, fontSize: 13, marginTop: 4 },
+  cardHeroFee: { color: C.text3, fontSize: 12, marginTop: 6, fontWeight: '600' },
+  // Rate row
+  rateRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.glass, borderWidth: 1, borderColor: C.glassBorder, borderRadius: 14, padding: 14, marginBottom: 8 },
+  rateRowLabel: { color: C.text, fontSize: 15, fontWeight: '600' },
+  rateRowDefault: { color: C.text3, fontSize: 11, marginTop: 2 },
+  rateValueWrap: { backgroundColor: 'rgba(255,255,255,0.06)', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 6, minWidth: 64, alignItems: 'center' },
+  rateValueWrapEdit: { backgroundColor: 'rgba(167,139,250,0.15)', borderWidth: 1, borderColor: 'rgba(167,139,250,0.4)' },
+  rateValue: { fontSize: 16, fontWeight: '800' },
+  rateResetBtn: { width: 30, height: 30, borderRadius: 15, backgroundColor: 'rgba(255,255,255,0.06)', justifyContent: 'center', alignItems: 'center', marginRight: 8 },
+  rateResetText: { color: C.text2, fontSize: 14 },
+  // Rate edit modal
+  rateEditWrap: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: C.glass, borderWidth: 1, borderColor: C.glassBorder, borderRadius: 14, paddingVertical: 14, marginTop: 8 },
+  rateEditInput: { color: C.text, fontSize: 36, fontWeight: '800', minWidth: 100, padding: 0 },
+  rateEditPct: { color: C.text2, fontSize: 28, fontWeight: '700', marginLeft: 4 },
+  // Remove buttons
+  removeCardBtn: { borderWidth: 1, borderColor: 'rgba(248,113,113,0.4)', borderRadius: 14, paddingVertical: 14, alignItems: 'center', marginTop: 22 },
+  removeCardBtnText: { color: C.red, fontSize: 14, fontWeight: '700' },
+  removeConfirmBtn: { backgroundColor: 'rgba(248,113,113,0.15)', borderWidth: 1, borderColor: 'rgba(248,113,113,0.4)', borderRadius: 14, paddingVertical: 14, alignItems: 'center' },
+  removeConfirmBtnText: { color: C.red, fontSize: 15, fontWeight: '700' },
   // Recommend cards
   recCard: { backgroundColor: C.glass, borderWidth: 1, borderColor: C.glassBorder, borderRadius: 18, padding: 18, marginBottom: 12 },
   recCardBest: { backgroundColor: 'rgba(124,58,237,0.12)', borderColor: 'rgba(124,58,237,0.4)' },
