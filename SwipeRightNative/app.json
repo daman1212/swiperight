@@ -1,14 +1,23 @@
 {
   "expo": {
-    "name": "SwipeRight",
+    "name": "SwipeRightt",
     "slug": "swiperight",
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
-    "newArchEnabled": false,
+    "newArchEnabled": true,
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "com.daman.swiperight"
-    }
+      "bundleIdentifier": "com.daman.swiperight",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "cde377c8-db38-45a7-8cba-e929cabe230d"
+      }
+    },
+    "icon": "./assets/images/icon.png"
   }
 }
