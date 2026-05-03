@@ -105,6 +105,38 @@ const CardTile = ({ card, selected, onToggle }) => (
   </TouchableOpacity>
 );
 
+// Reusable back button with big tap target
+const BackBtn = ({ navigation, onPress }) => (
+  <TouchableOpacity
+    onPress={onPress || (() => navigation.goBack())}
+    activeOpacity={0.6}
+    hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+    style={styles.backBtnNew}
+  >
+    <Text style={styles.backBtnNewText}>‹</Text>
+  </TouchableOpacity>
+);
+
+// Tappable logo: signed-in → Dashboard, otherwise → Home
+function LogoBtn({ navigation }) {
+  const { session, profile } = useApp();
+  function handlePress() {
+    // Signed-in with profile → Dashboard. Else → Home.
+    if (session && profile) {
+      navigation.reset({ index: 0, routes: [{ name: 'Dashboard' }] });
+    } else {
+      navigation.reset({ index: 0, routes: [{ name: 'Home' }] });
+    }
+  }
+  return (
+    <TouchableOpacity onPress={handlePress} activeOpacity={0.7} hitSlop={{ top: 8, bottom: 8 }} style={styles.logoBtnRow}>
+      <View style={styles.logoMark}><Text style={styles.logoMarkText} allowFontScaling={false}>↗</Text></View>
+      <Text style={styles.logoText} allowFontScaling={false}>SwipeRightt</Text>
+    </TouchableOpacity>
+  );
+}
+
+
 // ── COUNTRY PICKER ────────────────────────────────────────
 function CountryPickerBtn({ light = false, navigation }) {
   const { country, countryCode, setCountryCode, ownedCards, setOwnedCards } = useApp();
@@ -205,14 +237,18 @@ function HomeScreen({ navigation }) {
         <CountryPickerBtn light />
         <View style={{ flex: 1 }} />
       </View>
-      <View style={styles.homeContainer}>
-        <Animated.View style={{ opacity: fadeAnim, transform: [{ translateY: slideAnim }], alignItems: 'center' }}>
+      <ScrollView
+        contentContainerStyle={styles.homeScrollContent}
+        showsVerticalScrollIndicator={false}
+        bounces={true}
+      >
+        <Animated.View style={{ opacity: fadeAnim, transform: [{ translateY: slideAnim }], alignItems: 'center', width: '100%' }}>
           <View style={[styles.logoRow, { marginBottom: 20 }]}>
-            <View style={styles.logoMark}><Text style={styles.logoMarkText}>↗</Text></View>
-            <Text style={styles.logoText}>SwipeRightt</Text>
+            <View style={styles.logoMark}><Text style={styles.logoMarkText} allowFontScaling={false}>↗</Text></View>
+            <Text style={styles.logoText} allowFontScaling={false}>SwipeRightt</Text>
           </View>
           <Badge label="SMART CARD OPTIMIZATION" />
-          <Text style={styles.heroTitle}>Always swipe{'\n'}the <Text style={styles.heroTitleAccent}>right card.</Text></Text>
+          <Text style={styles.heroTitle} allowFontScaling={false}>Always swipe{'\n'}the <Text style={styles.heroTitleAccent}>right card.</Text></Text>
           <Text style={styles.heroSub}>Tell us which cards you own. We'll instantly tell you which one to use at any store.</Text>
           <PrimaryBtn label="Get started free →" onPress={() => navigation.navigate('Login')} style={{ width: width - 48, marginBottom: 12 }} />
           <GhostBtn label="Try without signing in" onPress={() => { setIsGuest(true); navigation.navigate('Setup'); }} style={{ width: width - 48 }} />
@@ -232,7 +268,7 @@ function HomeScreen({ navigation }) {
             ))}
           </View>
         </Animated.View>
-      </View>
+      </ScrollView>
 
       <Modal visible={showGate} transparent animationType="fade" onRequestClose={() => setShowGate(false)}>
         <TouchableOpacity activeOpacity={1} onPress={() => setShowGate(false)} style={styles.gateOverlay}>
@@ -283,11 +319,19 @@ function LoginScreen({ navigation }) {
       const s = { id: data.user.id, email: data.user.email };
       setSession(s);
       setIsGuest(false);
-      // Check profile + cards in parallel
-      const [{ data: profileData }, { data: cardData }] = await Promise.all([
-        sb.from('profiles').select('*').eq('id', s.id).single(),
-        sb.from('user_cards').select('cards').eq('user_id', s.id).single(),
-      ]);
+      // Fetch profile + cards. Use maybeSingle to avoid throws on no rows.
+      // Retry profile fetch once if it returns null (race against RLS / auth propagation)
+      async function fetchProfile() {
+        const { data: p } = await sb.from('profiles').select('*').eq('id', s.id).maybeSingle();
+        return p;
+      }
+      let profileData = await fetchProfile();
+      if (!profileData) {
+        // Brief wait then retry once — auth session may still be propagating
+        await new Promise(r => setTimeout(r, 400));
+        profileData = await fetchProfile();
+      }
+      const { data: cardData } = await sb.from('user_cards').select('cards').eq('user_id', s.id).maybeSingle();
       if (profileData) setProfile(profileData);
       let hasCards = ownedCards.length > 0;
       if (cardData?.cards) {
@@ -378,7 +422,7 @@ function LoginScreen({ navigation }) {
 
 // ── PROFILE SETUP (first-time signup) ────────────────────
 function ProfileSetupScreen({ navigation }) {
-  const { session, setProfile, country, setCountryCode } = useApp();
+  const { session, profile, setProfile, country, setCountryCode } = useApp();
   const [firstName, setFirstName] = useState('');
   const [lastName, setLastName] = useState('');
   const [username, setUsername] = useState('');
@@ -386,7 +430,32 @@ function ProfileSetupScreen({ navigation }) {
   const [selectedCountry, setSelectedCountry] = useState(country.code);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [checking, setChecking] = useState(true);
   const [usernameStatus, setUsernameStatus] = useState(null); // null, 'checking', 'available', 'taken', 'invalid'
+
+  // On mount: check if profile already exists. If so, skip to Dashboard.
+  // (Prevents loop where re-login asks for profile setup again.)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!session?.id) { setChecking(false); return; }
+      // Fast path: profile already in context
+      if (profile) {
+        navigation.reset({ index: 0, routes: [{ name: 'Dashboard' }] });
+        return;
+      }
+      // Otherwise ask Supabase directly
+      const { data } = await sb.from('profiles').select('*').eq('id', session.id).maybeSingle();
+      if (cancelled) return;
+      if (data) {
+        setProfile(data);
+        navigation.reset({ index: 0, routes: [{ name: 'Dashboard' }] });
+      } else {
+        setChecking(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   // Auto-suggest username when first name changes
   useEffect(() => {
@@ -419,6 +488,14 @@ function ProfileSetupScreen({ navigation }) {
       return;
     }
     setLoading(true); setError('');
+    // Defensive: if a profile somehow already exists (race / repeat), load it instead
+    const { data: existing } = await sb.from('profiles').select('*').eq('id', session.id).maybeSingle();
+    if (existing) {
+      setProfile(existing);
+      setLoading(false);
+      navigation.reset({ index: 0, routes: [{ name: 'Dashboard' }] });
+      return;
+    }
     const { error: e } = await sb.from('profiles').insert({
       id: session.id,
       username: username.toLowerCase().trim(),
@@ -430,6 +507,15 @@ function ProfileSetupScreen({ navigation }) {
     });
     setLoading(false);
     if (e) {
+      // 23505 = unique constraint violation. If id conflicts, profile exists. Load it.
+      if (e.code === '23505' && (e.message || '').toLowerCase().includes('id')) {
+        const { data: existing } = await sb.from('profiles').select('*').eq('id', session.id).maybeSingle();
+        if (existing) {
+          setProfile(existing);
+          navigation.reset({ index: 0, routes: [{ name: 'Dashboard' }] });
+          return;
+        }
+      }
       setError(e.message || 'Failed to save profile.');
       return;
     }
@@ -445,6 +531,15 @@ function ProfileSetupScreen({ navigation }) {
       email: session.email,
     });
     navigation.reset({ index: 0, routes: [{ name: 'Setup' }] });
+  }
+
+  // Show a loading indicator while we check if profile already exists
+  if (checking) {
+    return (
+      <View style={{ flex: 1, backgroundColor: C.bg, justifyContent: 'center', alignItems: 'center' }}>
+        <ActivityIndicator color={C.purpleLight} size="large" />
+      </View>
+    );
   }
 
   const usernameColor = usernameStatus === 'available' ? C.green : usernameStatus === 'taken' || usernameStatus === 'invalid' ? C.red : C.text3;
@@ -573,9 +668,7 @@ function ProfileScreen({ navigation }) {
       <StatusBar barStyle="light-content" />
       <View style={styles.navBar}>
         <View style={styles.logoRow}>
-          <TouchableOpacity onPress={() => navigation.goBack()} style={{ marginRight: 4 }}>
-            <Text style={styles.navLink}>←</Text>
-          </TouchableOpacity>
+          <BackBtn navigation={navigation} />
           <Text style={styles.logoText}>My Profile</Text>
         </View>
       </View>
@@ -639,9 +732,7 @@ function MyCardsScreen({ navigation }) {
       <StatusBar barStyle="light-content" />
       <View style={styles.navBar}>
         <View style={styles.logoRow}>
-          <TouchableOpacity onPress={() => navigation.goBack()} style={{ marginRight: 4 }}>
-            <Text style={styles.navLink}>←</Text>
-          </TouchableOpacity>
+          <BackBtn navigation={navigation} />
           <Text style={styles.logoText}>My Wallet</Text>
         </View>
         <Text style={styles.navLink}>{owned.length} card{owned.length !== 1 ? 's' : ''}</Text>
@@ -785,9 +876,7 @@ function CardDetailScreen({ navigation, route }) {
       <StatusBar barStyle="light-content" />
       <View style={styles.navBar}>
         <View style={styles.logoRow}>
-          <TouchableOpacity onPress={() => navigation.goBack()} style={{ marginRight: 4 }}>
-            <Text style={styles.navLink}>←</Text>
-          </TouchableOpacity>
+          <BackBtn navigation={navigation} />
           <Text style={styles.logoText}>Card Details</Text>
         </View>
         {hasAnyOverride && (
@@ -957,9 +1046,7 @@ function AddCardsScreen({ navigation }) {
       <StatusBar barStyle="light-content" />
       <View style={styles.navBar}>
         <View style={styles.logoRow}>
-          <TouchableOpacity onPress={() => navigation.goBack()} style={{ marginRight: 4 }}>
-            <Text style={styles.navLink}>←</Text>
-          </TouchableOpacity>
+          <BackBtn navigation={navigation} />
           <Text style={styles.logoText}>Add a card</Text>
         </View>
         <TouchableOpacity onPress={() => navigation.goBack()}>
@@ -1088,8 +1175,7 @@ function SetupScreen({ navigation }) {
       <View style={styles.navBar}>
         <View style={styles.logoRow}>
           <CountryPickerBtn navigation={navigation} />
-          <View style={styles.logoMark}><Text style={styles.logoMarkText}>↗</Text></View>
-          <Text style={styles.logoText}>SwipeRightt</Text>
+          <LogoBtn navigation={navigation} />
         </View>
         <TouchableOpacity onPress={() => navigation.navigate(session ? 'Dashboard' : 'Checkout')}>
           <Text style={styles.navLink}>{ownedCards.length > 0 ? 'Done' : 'Skip'}</Text>
@@ -1226,13 +1312,10 @@ function CheckoutScreen({ navigation }) {
       <View style={styles.navBar}>
         <View style={styles.logoRow}>
           {session ? (
-            <TouchableOpacity onPress={() => navigation.navigate('Dashboard')} style={{ marginRight: 4 }}>
-              <Text style={styles.navLink}>←</Text>
-            </TouchableOpacity>
+            <BackBtn navigation={navigation} onPress={() => navigation.navigate('Dashboard')} />
           ) : null}
           <CountryPickerBtn navigation={navigation} />
-          <View style={styles.logoMark}><Text style={styles.logoMarkText}>↗</Text></View>
-          <Text style={styles.logoText}>SwipeRightt</Text>
+          <LogoBtn navigation={navigation} />
         </View>
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 16 }}>
           <TouchableOpacity onPress={() => navigation.navigate('Setup')}>
@@ -1386,8 +1469,7 @@ function ResultScreen({ navigation, route }) {
       <StatusBar barStyle="light-content" />
       <View style={styles.navBar}>
         <View style={styles.logoRow}>
-          <View style={styles.logoMark}><Text style={styles.logoMarkText}>↗</Text></View>
-          <Text style={styles.logoText}>SwipeRightt</Text>
+          <LogoBtn navigation={navigation} />
         </View>
         <TouchableOpacity onPress={() => navigation.goBack()}>
           <Text style={styles.navLink}>← Back</Text>
@@ -1460,66 +1542,131 @@ function ResultScreen({ navigation, route }) {
 }
 
 // ── RECOMMEND (Find my next card) ─────────────────────────
+// Spending categories. presetsCA / presetsIN are arrays of preset amounts shown as tap chips.
 const SPENDING_CATEGORIES = [
-  { key: 'grocery', label: 'Groceries', icon: '🛒', defaultCA: 400, defaultIN: 8000, maxCA: 2000, maxIN: 40000, stepCA: 50, stepIN: 1000 },
-  { key: 'dining', label: 'Restaurants', icon: '🍽️', defaultCA: 200, defaultIN: 4000, maxCA: 1500, maxIN: 30000, stepCA: 50, stepIN: 500 },
-  { key: 'gas', label: 'Fuel', icon: '⛽', defaultCA: 200, defaultIN: 5000, maxCA: 1000, maxIN: 25000, stepCA: 25, stepIN: 500 },
-  { key: 'travel', label: 'Travel & Hotels', icon: '✈️', defaultCA: 100, defaultIN: 2000, maxCA: 3000, maxIN: 60000, stepCA: 100, stepIN: 1000 },
-  { key: 'online', label: 'Online Shopping', icon: '🛍️', defaultCA: 200, defaultIN: 5000, maxCA: 2000, maxIN: 40000, stepCA: 50, stepIN: 1000 },
-  { key: 'amazon', label: 'Amazon', icon: '📦', defaultCA: 100, defaultIN: 3000, maxCA: 1500, maxIN: 25000, stepCA: 25, stepIN: 500 },
-  { key: 'streaming', label: 'Streaming', icon: '🎬', defaultCA: 30, defaultIN: 500, maxCA: 200, maxIN: 3000, stepCA: 5, stepIN: 100 },
-  { key: 'other', label: 'Everything else', icon: '💳', defaultCA: 300, defaultIN: 5000, maxCA: 3000, maxIN: 60000, stepCA: 50, stepIN: 1000 },
+  { key: 'grocery', label: 'Groceries', icon: '🛒',
+    defaultCA: 400, defaultIN: 8000,
+    presetsCA: [0, 100, 200, 400, 600, 800, 1000],
+    presetsIN: [0, 2000, 5000, 8000, 12000, 18000, 25000] },
+  { key: 'dining', label: 'Restaurants', icon: '🍽️',
+    defaultCA: 200, defaultIN: 4000,
+    presetsCA: [0, 50, 100, 200, 350, 500, 800],
+    presetsIN: [0, 1000, 2500, 4000, 6000, 10000, 15000] },
+  { key: 'gas', label: 'Fuel', icon: '⛽',
+    defaultCA: 200, defaultIN: 5000,
+    presetsCA: [0, 50, 100, 200, 300, 500, 800],
+    presetsIN: [0, 1500, 3000, 5000, 8000, 12000, 18000] },
+  { key: 'travel', label: 'Travel & Hotels', icon: '✈️',
+    defaultCA: 100, defaultIN: 2000,
+    presetsCA: [0, 50, 100, 250, 500, 1000, 2000],
+    presetsIN: [0, 1000, 2000, 5000, 10000, 20000, 40000] },
+  { key: 'online', label: 'Online Shopping', icon: '🛍️',
+    defaultCA: 200, defaultIN: 5000,
+    presetsCA: [0, 50, 100, 200, 400, 700, 1200],
+    presetsIN: [0, 1000, 2500, 5000, 10000, 18000, 30000] },
+  { key: 'amazon', label: 'Amazon', icon: '📦',
+    defaultCA: 100, defaultIN: 3000,
+    presetsCA: [0, 25, 50, 100, 200, 400, 800],
+    presetsIN: [0, 500, 1500, 3000, 6000, 10000, 18000] },
+  { key: 'streaming', label: 'Streaming', icon: '🎬',
+    defaultCA: 30, defaultIN: 500,
+    presetsCA: [0, 10, 20, 30, 50, 80, 120],
+    presetsIN: [0, 200, 500, 800, 1200, 2000, 3000] },
+  { key: 'other', label: 'Everything else', icon: '💳',
+    defaultCA: 300, defaultIN: 5000,
+    presetsCA: [0, 100, 200, 300, 500, 1000, 2000],
+    presetsIN: [0, 1500, 3000, 5000, 10000, 20000, 40000] },
 ];
 
-function StepperRow({ label, icon, value, onChange, min, max, step, currency, expanded, onToggle }) {
-  const [trackWidth, setTrackWidth] = useState(0);
-  const pct = max > min ? (value - min) / (max - min) : 0;
+function StepperRow({ label, icon, value, onChange, presets, currency, expanded, onToggle }) {
+  const [showCustom, setShowCustom] = useState(false);
+  const [customValue, setCustomValue] = useState('');
 
-  function handleSliderTouch(e) {
-    if (trackWidth <= 0) return;
-    const x = e.nativeEvent.locationX;
-    const ratio = Math.max(0, Math.min(1, x / trackWidth));
-    let raw = min + ratio * (max - min);
-    raw = Math.round(raw / step) * step;
-    raw = Math.max(min, Math.min(max, raw));
-    onChange(raw);
+  function pickPreset(amt) {
+    onChange(amt);
+    setShowCustom(false);
   }
+
+  function applyCustom() {
+    const num = parseFloat(customValue);
+    if (!isNaN(num) && num >= 0) {
+      onChange(Math.round(num));
+    }
+    setShowCustom(false);
+    setCustomValue('');
+  }
+
+  // Is the current value matching any preset?
+  const isPreset = presets.includes(value);
 
   return (
     <View>
       <TouchableOpacity onPress={onToggle} activeOpacity={0.6} style={styles.stepperRow}>
-        <Text style={{ fontSize: 22, marginRight: 12 }}>{icon}</Text>
+        <Text style={{ fontSize: 22, marginRight: 12 }} allowFontScaling={false}>{icon}</Text>
         <View style={{ flex: 1 }}>
           <Text style={styles.stepperLabel}>{label}</Text>
           <Text style={styles.stepperValue}>{currency}{value.toLocaleString()}/mo</Text>
         </View>
-        <TouchableOpacity onPress={() => onChange(Math.max(min, value - step))} activeOpacity={0.6} style={styles.stepperBtn}>
-          <Text style={styles.stepperBtnText}>−</Text>
-        </TouchableOpacity>
-        <TouchableOpacity onPress={() => onChange(Math.min(max, value + step))} activeOpacity={0.6} style={styles.stepperBtn}>
-          <Text style={styles.stepperBtnText}>+</Text>
-        </TouchableOpacity>
+        <Text style={{ color: C.text3, fontSize: 18, marginLeft: 8 }} allowFontScaling={false}>{expanded ? '▴' : '▾'}</Text>
       </TouchableOpacity>
       {expanded && (
-        <View style={styles.sliderWrap}>
-          <View
-            style={styles.sliderTrack}
-            onLayout={e => setTrackWidth(e.nativeEvent.layout.width)}
-            onStartShouldSetResponder={() => true}
-            onMoveShouldSetResponder={() => true}
-            onResponderGrant={handleSliderTouch}
-            onResponderMove={handleSliderTouch}
-          >
-            <View style={styles.sliderTrackBg} />
-            <View style={[styles.sliderFill, { width: `${pct * 100}%` }]} />
-            <View style={[styles.sliderThumb, { left: `${pct * 100}%` }]} />
-          </View>
-          <View style={styles.sliderLabels}>
-            <Text style={styles.sliderLabelText}>{currency}{min.toLocaleString()}</Text>
-            <Text style={styles.sliderLabelText}>{currency}{max.toLocaleString()}</Text>
+        <View style={styles.chipsWrap}>
+          <View style={styles.chipsRow}>
+            {presets.map(amt => {
+              const active = value === amt;
+              return (
+                <TouchableOpacity
+                  key={amt}
+                  onPress={() => pickPreset(amt)}
+                  activeOpacity={0.7}
+                  style={[styles.chip2, active && styles.chip2Active]}
+                >
+                  <Text style={[styles.chip2Text, active && styles.chip2TextActive]}>
+                    {amt === 0 ? '0' : `${currency}${amt.toLocaleString()}`}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+            <TouchableOpacity
+              onPress={() => { setShowCustom(true); setCustomValue(String(value)); }}
+              activeOpacity={0.7}
+              style={[styles.chip2, !isPreset && styles.chip2Active]}
+            >
+              <Text style={[styles.chip2Text, !isPreset && styles.chip2TextActive]}>
+                {!isPreset ? `${currency}${value.toLocaleString()}` : 'Custom'}
+              </Text>
+            </TouchableOpacity>
           </View>
         </View>
       )}
+
+      <Modal visible={showCustom} transparent animationType="fade" onRequestClose={() => setShowCustom(false)}>
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
+          <TouchableOpacity activeOpacity={1} onPress={() => setShowCustom(false)} style={styles.gateOverlay}>
+            <TouchableOpacity activeOpacity={1} onPress={() => {}} style={styles.gateCard}>
+              <Text style={styles.gateTitle}>{icon} {label}</Text>
+              <Text style={[styles.gateSub, { marginBottom: 14 }]}>Enter your monthly spending</Text>
+              <View style={styles.rateEditWrap}>
+                <Text style={[styles.rateEditPct, { marginLeft: 0, marginRight: 4 }]}>{currency}</Text>
+                <TextInput
+                  style={styles.rateEditInput}
+                  value={customValue}
+                  onChangeText={t => setCustomValue(t.replace(/[^0-9]/g, ''))}
+                  keyboardType="number-pad"
+                  autoFocus
+                  selectTextOnFocus
+                  textAlign="center"
+                  selectionColor={C.purpleLight}
+                />
+              </View>
+              <PrimaryBtn label="Set amount" onPress={applyCustom} style={{ marginTop: 18 }} />
+              <TouchableOpacity onPress={() => setShowCustom(false)} style={{ marginTop: 12, alignItems: 'center' }}>
+                <Text style={styles.linkText}>Cancel</Text>
+              </TouchableOpacity>
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </KeyboardAvoidingView>
+      </Modal>
     </View>
   );
 }
@@ -1571,8 +1718,7 @@ function RecommendScreen({ navigation }) {
       <StatusBar barStyle="light-content" />
       <View style={styles.navBar}>
         <View style={styles.logoRow}>
-          <View style={styles.logoMark}><Text style={styles.logoMarkText}>↗</Text></View>
-          <Text style={styles.logoText}>SwipeRightt</Text>
+          <LogoBtn navigation={navigation} />
         </View>
         <TouchableOpacity onPress={() => navigation.goBack()}>
           <Text style={styles.navLink}>← Back</Text>
@@ -1595,9 +1741,7 @@ function RecommendScreen({ navigation }) {
                   icon={c.icon}
                   value={spending[c.key]}
                   onChange={v => setSpending({ ...spending, [c.key]: v })}
-                  min={0}
-                  max={country.code === 'IN' ? c.maxIN : c.maxCA}
-                  step={country.code === 'IN' ? c.stepIN : c.stepCA}
+                  presets={country.code === 'IN' ? c.presetsIN : c.presetsCA}
                   currency={cur}
                   expanded={expandedCat === c.key}
                   onToggle={() => setExpandedCat(expandedCat === c.key ? null : c.key)}
@@ -1757,8 +1901,7 @@ function DashboardScreen({ navigation }) {
       <View style={styles.navBar}>
         <View style={styles.logoRow}>
           <CountryPickerBtn navigation={navigation} />
-          <View style={styles.logoMark}><Text style={styles.logoMarkText}>↗</Text></View>
-          <Text style={styles.logoText}>SwipeRightt</Text>
+          <LogoBtn navigation={navigation} />
         </View>
         <TouchableOpacity onPress={() => setShowMenu(!showMenu)} activeOpacity={0.7}>
           <View style={styles.avatarSmall}>
@@ -2058,10 +2201,18 @@ export default function App() {
       if (savedOverrides) setCardOverrides(JSON.parse(savedOverrides));
       if (s) {
         setSession({ id: s.user.id, email: s.user.email });
-        // Load profile
-        const { data: profileData } = await sb.from('profiles').select('*').eq('id', s.user.id).single();
+        // Load profile (with retry for race conditions)
+        async function fetchProfileBoot() {
+          const { data: p } = await sb.from('profiles').select('*').eq('id', s.user.id).maybeSingle();
+          return p;
+        }
+        let profileData = await fetchProfileBoot();
+        if (!profileData) {
+          await new Promise(r => setTimeout(r, 400));
+          profileData = await fetchProfileBoot();
+        }
         if (profileData) setProfile(profileData);
-        const { data } = await sb.from('user_cards').select('cards').eq('user_id', s.user.id).single();
+        const { data } = await sb.from('user_cards').select('cards').eq('user_id', s.user.id).maybeSingle();
         if (data?.cards) { setOwnedCards(data.cards); await AsyncStorage.setItem('sr_cards', JSON.stringify(data.cards)); }
         // Routing logic
         if (onboarded) {
@@ -2124,6 +2275,7 @@ export default function App() {
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: C.bg },
   homeContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24, paddingVertical: 40 },
+  homeScrollContent: { flexGrow: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24, paddingVertical: 40 },
   homeTopBar: { flexDirection: 'row', paddingHorizontal: 20, paddingTop: 8, zIndex: 10, position: 'relative' },
   countryBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: C.glass, borderWidth: 1, borderColor: C.glassBorder, borderRadius: 100, paddingHorizontal: 10, paddingVertical: 6, marginRight: 6 },
   countryFlag: { fontSize: 18 },
@@ -2157,6 +2309,11 @@ const styles = StyleSheet.create({
   loginContainer: { padding: 24, paddingTop: 16, paddingBottom: 60 },
   backBtn: { marginBottom: 28 },
   backBtnText: { color: C.text2, fontSize: 14 },
+  // New big-tap-target back button
+  backBtnNew: { width: 32, height: 32, borderRadius: 16, justifyContent: 'center', alignItems: 'center', marginRight: 2, marginLeft: -6 },
+  backBtnNewText: { color: C.text, fontSize: 26, fontWeight: '400', lineHeight: 26, marginTop: -2 },
+  // Tappable logo row
+  logoBtnRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   screenTitle: { fontSize: 32, fontWeight: '800', color: C.text, letterSpacing: -1, marginBottom: 8, marginTop: 12 },
   screenSub: { fontSize: 15, color: C.text2, lineHeight: 22, marginBottom: 4 },
   glassCard: { backgroundColor: C.glass, borderWidth: 1, borderColor: C.glassBorder, borderRadius: 18, padding: 20 },
@@ -2253,6 +2410,13 @@ const styles = StyleSheet.create({
   sliderThumb: { position: 'absolute', top: 8, width: 20, height: 20, borderRadius: 10, backgroundColor: '#fff', borderWidth: 2, borderColor: '#7c3aed', marginLeft: -10, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.4, shadowRadius: 4 },
   sliderLabels: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 6, paddingHorizontal: 2 },
   sliderLabelText: { fontSize: 11, color: 'rgba(255,255,255,0.4)', fontWeight: '600' },
+  // Chips selector for spending presets
+  chipsWrap: { paddingTop: 12, paddingBottom: 16, paddingHorizontal: 4 },
+  chipsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  chip2: { backgroundColor: C.glass, borderWidth: 1, borderColor: C.glassBorder, borderRadius: 100, paddingHorizontal: 14, paddingVertical: 9 },
+  chip2Active: { backgroundColor: 'rgba(124,58,237,0.20)', borderColor: C.purpleLight },
+  chip2Text: { color: C.text2, fontSize: 13, fontWeight: '600' },
+  chip2TextActive: { color: C.purpleLight, fontWeight: '700' },
   // Onboarding
   onbTop: { flexDirection: 'row', justifyContent: 'flex-end', paddingHorizontal: 24, paddingTop: 12 },
   onbBody: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 32 },
